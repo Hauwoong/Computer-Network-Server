@@ -3,5 +3,11 @@
 *.o
 *.obj
 
+# 실행 중 생기는 데이터베이스 파일 (런타임 데이터)
+data.db
+
 # Claude Code 로컬 설정 폴더 (과제와 무관)
 .claude/
+
+# Visual Studio 로컬 폴더 (과제와 무관)
+.vs/
