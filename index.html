@@ -1,0 +1,23 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="utf-8">
+    <title>소켓 HTTP 서버</title>
+</head>
+<body>
+    <h1>C++ 소켓 HTTP 서버에 오신 것을 환영합니다</h1>
+    <p>이 페이지는 서버가 디스크의 <code>index.html</code> 파일을 실제로 읽어 전송한 것입니다.
+       (<code>/</code> 또는 <code>/index.html</code>로 접속 시 표시됩니다.)</p>
+
+    <h2>제공하는 API</h2>
+    <ul>
+        <li><b>GET</b> /users → 전체 회원 목록 조회 (200)</li>
+        <li><b>GET</b> /users/{id} → 특정 회원 조회 (있으면 200, 없으면 404)</li>
+        <li><b>POST</b> /users → 회원 생성 (201, Location 헤더로 위치 안내)</li>
+        <li><b>PUT</b> /users/{id} → 회원 수정 (200 / 없으면 404)</li>
+        <li><b>DELETE</b> /users/{id} → 회원 삭제 (200 / 없으면 404)</li>
+    </ul>
+
+    <p>모든 오류 응답(400·403·404·405·413·500)은 실제 서버 상태를 확인해 반환됩니다.</p>
+</body>
+</html>

@@ -14,8 +14,70 @@
 
 using namespace std;
 
+// 서버로부터 완전한 HTTP 응답 하나(헤더+본문)를 읽어 돌려준다.
+// buf: 연결 동안 받은 데이터가 쌓이는 버퍼(다음 응답 조각이 미리 와 있을 수 있어 유지).
+// 연결이 끊기면 빈 문자열.
+
+// send()는 요청한 바이트를 한 번에 다 못 보낼 수 있으므로, 다 보낼 때까지 반복한다.
+bool sendAll(SOCKET sock, const string& data)
+{
+    int totalSent = 0;
+    while (totalSent < (int)data.size())
+    {
+        int sent = send(sock, data.c_str() + totalSent, (int)data.size() - totalSent, 0);
+        if (sent <= 0) return false;
+        totalSent += sent;
+    }
+    return true;
+}
+
+string readOneResponse(SOCKET sock, string& buf)
+{
+    // 1) 헤더 끝(\r\n\r\n)까지 받는다
+    size_t headerEnd;
+    while ((headerEnd = buf.find("\r\n\r\n")) == string::npos)
+    {
+        char tmp[4096];
+        int n = recv(sock, tmp, sizeof(tmp), 0);
+        if (n <= 0) return "";
+        buf.append(tmp, n);
+    }
+
+    // 2) Content-Length 파악
+    int contentLength = 0;
+    size_t clPos = buf.find("Content-Length:");
+    if (clPos == string::npos) clPos = buf.find("content-length:");
+    if (clPos != string::npos && clPos < headerEnd)
+        contentLength = atoi(buf.c_str() + clPos + 15);
+
+    // 3) 헤더+본문 전체가 올 때까지 받는다
+    size_t totalNeeded = headerEnd + 4 + contentLength;
+    while (buf.size() < totalNeeded)
+    {
+        char tmp[4096];
+        int n = recv(sock, tmp, sizeof(tmp), 0);
+        if (n <= 0) return "";
+        buf.append(tmp, n);
+    }
+
+    // 4) 응답 하나만 잘라 반환, 나머지는 buf에 남김
+    string oneResp = buf.substr(0, totalNeeded);
+    buf.erase(0, totalNeeded);
+    return oneResp;
+}
+
+// HTTP 메시지에서 본문(빈 줄 뒤)만 잘라내는 도우미
+string getBody(string msg)
+{
+    size_t pos = msg.find("\r\n\r\n");
+    if (pos == string::npos) return "";
+    return msg.substr(pos + 4);
+}
+
+
 int main() {
-    SetConsoleOutputCP(CP_UTF8);
+    SetConsoleOutputCP(CP_UTF8);   // 콘솔 출력 UTF-8
+    SetConsoleCP(CP_UTF8);         // 콘솔 입력도 UTF-8 (한글 이름 입력이 안 깨지도록)
 
     // ---- 1) WSAStartup ----
     WSADATA wsa;
@@ -47,59 +109,154 @@ int main() {
     }
     cout << "서버에 연결됨!\n";
 
-    // ---- 4) 메뉴: 어떤 요청을 보낼지 고른다  ----
-    cout << "\n어떤 요청을 보낼까요?\n";
-    cout << " 1) GET /index.html  (200 OK)\n";
-    cout << " 2) GET /users       (DB 조회 , 200)\n";
-    cout << " 3) GET /nope        (404 Not Found)\n";
-    cout << " 4) HEAD /index.html (헤더만)\n";
-    cout << " 5) POST /users      (DB 저장, 201)\n";
-    cout << " 6) PUT /users/1     (수정 , 200)\n";
-    cout << " 7) POST /continue   (100 Continue)\n";
-    cout << " 번호 선택: ";
-    int choice;
-    cin >> choice;
+    // 이 연결 동안 받은 데이터가 쌓이는 버퍼 (readOneResponse가 사용)
+    string buf = "";
 
-    // 선택에 따라 메서드/경로/본문을 정한다
-    string method, path, body;
-    if      (choice == 1) { method = "GET"; path = "/index.html"; body = ""; }
-    else if (choice == 2) { method = "GET"; path = "/users"; body = ""; }
-    else if (choice == 3) { method = "GET"; path = "/nope"; body = ""; }
-    else if (choice == 4) { method = "HEAD"; path = "/index.html"; body = ""; }
-    else if (choice == 5) { method = "POST"; path = "/users"; body = ""; }
-    else if (choice == 6) { method = "PUT"; path = "/users/1"; body = ""; }
-    else if (choice == 7) { method = "POST"; path = "/continue"; body = "hello"; }
-    else { cout << "잘못된 번호\n"; closesocket(sock); WSACleanup(); return 1; }
+    // 화면 출력용 구분선 (너비를 통일해 보기 좋게)
+    string BAR(40, '=');
+    string DASH(40, '-');
 
-    // POST 나 PUT은 원하는 데이터를 직접 입력
-    if (method == "POST" || method == "PUT")
+    // ---- 4) 메뉴 반복: 한 연결로 여러 요청을 보낸다 (keep-alive) ----
+    while (true)
     {
-        cout << "보낼 데이터를 입력하세요 (예: name=kim&age=20): ";
-        cin >> body;
+        // (a) 현재 회원 목록을 먼저 보여준다 (서버 현황 파악)
+        {
+            string listReq =
+                "GET /users HTTP/1.1\r\n"
+                "Host: 127.0.0.1:8080\r\n"
+                "\r\n";
+            sendAll(sock, listReq);
+            string listResp = readOneResponse(sock, buf);
+            cout << "\n" << BAR << "\n";
+            cout << " 현재 등록된 회원 목록\n";
+            cout << BAR << "\n";
+            string listBody = getBody(listResp);
+            if (listBody.empty()) cout << " (비어 있음)\n";
+            else                  cout << listBody;
+            cout << BAR << "\n";
+        }
+
+        // (b) 메뉴
+        cout << "\n어떤 요청을 보낼까요?\n";
+        cout << " 1) 조회 (GET)\n";
+        cout << " 2) 생성 (POST)\n";
+        cout << " 3) 수정 (PUT)\n";
+        cout << " 4) 삭제 (DELETE)\n";
+        cout << " 9) 클라이언트만 종료 (서버는 계속 실행)\n";
+        cout << " 0) 전체 종료 (서버까지 종료)\n";
+        cout << " 번호 선택: ";
+        int choice;
+        cin >> choice;
+
+        if (choice == 9) break;   // 클라이언트만 종료 (서버는 계속 실행)
+
+        // 0번: 전체 종료 - 서버에 종료 요청을 보낸 뒤 클라이언트도 함께 종료
+        if (choice == 0)
+        {
+            string request =
+                "POST /shutdown HTTP/1.1\r\n"
+                "Host: 127.0.0.1:8080\r\n"
+                "\r\n";
+            sendAll(sock, request);
+            string response = readOneResponse(sock, buf);
+            cout << "\n" << DASH << "\n";
+            cout << " 받은 응답\n";
+            cout << DASH << "\n";
+            cout << response << "\n";
+            cout << DASH << "\n";
+            break;   // 서버가 종료됐으니 클라이언트도 종료
+        }
+
+        string method, path, body;
+        if      (choice == 1) method = "GET";
+        else if (choice == 2) method = "POST";
+        else if (choice == 3) method = "PUT";
+        else if (choice == 4) method = "DELETE";
+        else { cout << "잘못된 번호\n"; continue; }
+
+        // (c) 경로 결정 (사용자는 경로 형식을 몰라도 되게 한다)
+        //  - POST(생성): 항상 /users 컬렉션 (id는 서버가 부여)
+        //  - GET(조회): 회원 번호만 입력 (0이면 전체 목록)
+        //  - PUT/DELETE: 대상 회원 번호만 입력
+        if (method == "POST")
+        {
+            path = "/users";
+            cout << "(POST는 /users 컬렉션에 생성합니다. id는 서버가 자동 부여)\n";
+        }
+        else if (method == "GET")
+        {
+            cout << "조회할 회원 번호를 입력하세요 (전체 목록은 0): ";
+            int num;
+            cin >> num;
+            if (num == 0) path = "/users";
+            else          path = "/users/" + to_string(num);
+        }
+        else   // PUT, DELETE
+        {
+            cout << "회원 번호를 입력하세요: ";
+            int num;
+            cin >> num;
+            path = "/users/" + to_string(num);
+
+            // PUT(수정)·DELETE(삭제)는 대상 회원이 실제 있는지 먼저 확인한다.
+            // 없으면 안내 후 메뉴로 돌아간다(PUT은 이름·나이 입력 헛수고도 방지).
+            if (method == "PUT" || method == "DELETE")
+            {
+                string checkReq =
+                    "GET " + path + " HTTP/1.1\r\n"
+                    "Host: 127.0.0.1:8080\r\n"
+                    "\r\n";
+                sendAll(sock, checkReq);
+                string checkResp = readOneResponse(sock, buf);
+                if (checkResp.rfind("HTTP/1.1 200", 0) != 0)   // 200으로 시작하지 않으면 = 없는 회원
+                {
+                    cout << "\n[안내] " << num << "번은 없는 회원번호입니다. 다시 선택해주세요.\n";
+                    continue;   // 메뉴로 돌아감
+                }
+            }
+        }
+
+        // (d) POST/PUT은 이름·나이를 따로 입력받아 body를 자동 조립한다
+        //     (사용자는 name=...&age=... 형식을 몰라도 됨)
+        if (method == "POST" || method == "PUT")
+        {
+            string name, age;
+            cout << "이름을 입력하세요: ";
+            cin >> name;
+            cout << "나이를 입력하세요: ";
+            cin >> age;
+            body = "name=" + name + "&age=" + age;   // 시스템이 폼 형식으로 변환
+        }
+
+        // (e) 요청 조립 — keep-alive이므로 Connection: close 는 넣지 않는다
+        string request = method + " " + path + " HTTP/1.1\r\n";
+        request += "Host: 127.0.0.1:8080\r\n";
+        if (!body.empty())
+        {
+            request += "Content-Type: application/x-www-form-urlencoded\r\n";
+            request += "Content-Length: " + to_string(body.size()) + "\r\n";
+        }
+        request += "\r\n";
+        request += body;
+
+        // (f) 전송 + 응답 하나 받기
+        sendAll(sock, request);
+        cout << "\n" << DASH << "\n";
+        cout << " 보낸 요청\n";
+        cout << DASH << "\n";
+        cout << request << "\n";
+        cout << DASH << "\n";
+
+        string response = readOneResponse(sock, buf);
+        cout << "\n" << DASH << "\n";
+        cout << " 받은 응답\n";
+        cout << DASH << "\n";
+        cout << response << "\n";
+        cout << DASH << "\n";
     }
 
-    //요청 조립: 시작줄 + 헤더 + (본문 있으면 Content-Length) + 빈 줄 + 본문
-    string request = method + " " + path + " HTTP/1.1\r\n";
-    request += "Host: 127.0.0.1:8080\r\n";
-    if (!body.empty())  // POST/PUT 처럼 본문이 있을때만 길이를 알려준다
-    {
-        request += "Content-Type: application/x-www-form-urlencoded\r\n";
-        request += "Content-Length: " + to_string(body.size()) + "\r\n";
-    }
-    request += "Connection: close\r\n";
-    request += "\r\n";
-    request += body;
-
-    send(sock, request.c_str(), (int)request.size(), 0);
-    cout << "------------보낸 요청------------\n" << request << "----------------------\n";
-
-    // ---- 5) 응답(Response) 받기 ----
-    char buffer[4096] = {0};
-    int len = recv(sock, buffer, sizeof(buffer)-1, 0);
-    if (len > 0){
-        buffer[len] = '\0';
-        cout << "----------- 받은 응답 -----------\n" << buffer << "\n----------------------\n";
-    }
+    // ---- 5) 종료: 반복이 끝나면 그때 연결을 닫는다 ----
+    cout << "\n연결을 종료합니다.\n";
 
     // ---- 6) 정리 ----
     closesocket(sock);
