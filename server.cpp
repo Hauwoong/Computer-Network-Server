@@ -1,7 +1,11 @@
 //==========================================================
-// server.cpp - 최소 동작 서버
-// 연결을 1번 받아서, 받은 요청을 화면에 출력하고,
-// 간단한 200 OK 응답을 보낸 뒤 종료한다.
+// server.cpp - 소켓 기반 HTTP/1.1 서버
+//  - 포트 8080에서 TCP 연결을 받아 HTTP 요청을 직접 파싱한다.
+//  - 회원(users) 자원에 대한 GET/POST/PUT/DELETE를 SQLite로 처리한다.
+//  - 오류는 하드코딩이 아니라 실제 서버 상태(DB 처리 결과·파일 존재 여부 등)로
+//    판단해 알맞은 상태 코드(200/201/400/403/404/405/413/500)를 회신한다.
+//  - 연결마다 스레드를 만들어 동시 접속을 처리하고(멀티스레드),
+//    한 연결에서 여러 요청을 주고받는다(HTTP/1.1 keep-alive).
 //==========================================================
 
 #include <iostream> // 화면 출력 cout
@@ -19,11 +23,13 @@
 
 using namespace std;
 
-sqlite3* db; // 데이터베이스 포인터
-mutex dbMutex; // DB 접근 동기화용 뮤텍스
-mutex coutMutex; // 로그 출력이 스레드끼리 섞이지 않게 하는 자물쇠
+// ---- 전역 상태 (모든 연결 스레드가 공유) ----
+sqlite3* db;      // SQLite 연결 핸들 (main에서 한 번 열고 이후 계속 사용)
+mutex dbMutex;    // 여러 스레드가 동시에 DB를 만지지 않도록 보호 (데이터 경합 방지)
+mutex coutMutex;  // 여러 스레드의 로그 출력이 한 줄씩 완결되도록 보호 (줄 섞임 방지)
 
-// 서버로부터 완전한 HTTP 요청 하나(헤더+본문)를 읽어 돌려준다.
+// send()는 요청한 바이트를 한 번에 다 못 보낼 수 있으므로(소켓 버퍼가 차면 일부만 전송),
+// 전부 보낼 때까지 반복한다. 응답이 커도 잘리지 않도록 보장. 실패 시 false.
 bool sendAll(SOCKET sock, const string& data)
 {
     int totalSent = 0;  // 총 전송한 바이트 수
@@ -36,7 +42,11 @@ bool sendAll(SOCKET sock, const string& data)
     return true; // 전송 성공
 }
 
-// HTTP 요청을 읽어, 헤더 끝(\r\n\r\n)까지 읽고, Content-Length를 확인하여 본문까지 모두 읽는다.
+// 한 연결(sock)에서 "완전한 HTTP 요청 하나"를 정확히 읽어 돌려준다.
+// keep-alive에서는 연결이 안 끊기므로 "끝까지 읽기"가 불가능하다. 그래서 헤더 끝(\r\n\r\n)을
+// 찾고 Content-Length만큼 본문을 읽어 요청 하나의 경계를 잡아낸다(=메시지 프레이밍).
+// buf: 이 연결에서 받은 바이트가 쌓이는 버퍼. 다음 요청 조각이 미리 와 있을 수 있어 유지한다.
+// 반환: 요청 문자열 하나. 연결이 끊기면 빈 문자열("").
 string readOneRequest(SOCKET sock, string& buf)
 {
     // 1) 헤더의 끝(\r\n\r\n)이 buf에 들어올 때까지 계속 받는다
@@ -105,7 +115,10 @@ string formatData(const string& data)
     return result;
 }
 
-// 메서드와 경로를 보고, 알맞은 응답 문자열을 만들어 돌려주는 함수
+// 메서드와 경로를 보고 알맞은 HTTP 응답 문자열 전체를 만들어 돌려주는 라우팅 함수.
+// 검사 순서가 중요하다: 구체적인 경로(/users, /users/{id})를 먼저 보고,
+// 아무 경로나 잡는 파일 서빙(GET)과 405/404 fallback은 반드시 뒤에 둔다.
+// 그래야 /users 요청이 파일 서빙에 먼저 가로채이지 않는다.
 string buildResponse(string method, string path, string body)
 {
     // [케이스 1] GET /users -> DB에서 회원 목록 꺼내기 (SELECT)
@@ -489,18 +502,22 @@ void handleClient(SOCKET clientSock)
 {
     { lock_guard<mutex> lk(coutMutex); cout << "\n[새 연결] 클라이언트 접속됨\n"; }
 
-    string buf = "";   // 이 연결 동안 받은 데이터가 쌓이는 버퍼
+    // 이 연결 동안 받은 바이트가 쌓이는 버퍼. readOneRequest가 이 버퍼를 공유하며
+    // 한 요청씩 잘라 쓰고, 남은 조각(다음 요청)은 여기에 남겨 둔다.
+    string buf = "";
 
     // 한 연결에서 요청이 오는 동안 계속 처리 (keep-alive)
     while (true) {
         string requestStr = readOneRequest(clientSock, buf);
-        if (requestStr.empty()) break;   // 클라이언트가 연결을 닫음
+        if (requestStr.empty()) break;   // 상대가 연결을 닫음 -> 이 연결 처리 종료
 
+        // 요청 첫 줄 "METHOD PATH VERSION"을 공백 기준으로 세 조각으로 분리
         istringstream iss(requestStr);
         string method, path, version;
         iss >> method >> path >> version;
         { lock_guard<mutex> lk(coutMutex); cout << "[요청] 메서드=" << method << "  경로=" << path << "  버전=" << version << "\n"; }
 
+        // 헤더와 본문의 경계(\r\n\r\n) 다음부터가 본문(POST/PUT의 데이터)
         string body = "";
         size_t pos = requestStr.find("\r\n\r\n");
         if (pos != string::npos)
