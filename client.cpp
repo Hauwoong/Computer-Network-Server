@@ -199,23 +199,8 @@ int main() {
             int num;
             cin >> num;
             path = "/users/" + to_string(num);
-
-            // PUT(수정)·DELETE(삭제)는 대상 회원이 실제 있는지 먼저 확인한다.
-            // 없으면 안내 후 메뉴로 돌아간다(PUT은 이름·나이 입력 헛수고도 방지).
-            if (method == "PUT" || method == "DELETE")
-            {
-                string checkReq =
-                    "GET " + path + " HTTP/1.1\r\n"
-                    "Host: 127.0.0.1:8080\r\n"
-                    "\r\n";
-                sendAll(sock, checkReq);
-                string checkResp = readOneResponse(sock, buf);
-                if (checkResp.rfind("HTTP/1.1 200", 0) != 0)   // 200으로 시작하지 않으면 = 없는 회원
-                {
-                    cout << "\n[안내] " << num << "번은 없는 회원번호입니다. 다시 선택해주세요.\n";
-                    continue;   // 메뉴로 돌아감
-                }
-            }
+            // (사전확인 제거) 입력한 번호를 그대로 서버로 보낸다.
+            // 없는 회원이면 서버가 sqlite3_changes()==0 으로 404를, 잘못된 번호면 400을 응답한다.
         }
 
         // (d) POST/PUT은 이름·나이를 따로 입력받아 body를 자동 조립한다
